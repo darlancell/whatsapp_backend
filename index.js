@@ -1,45 +1,43 @@
 const express = require('express');
 const cors = require('cors');
+const mongoose = require('mongoose');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const admin = require('firebase-admin');
-const path = require('path');
+const qrcode = require('qrcode');
 
-// 🔑 Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.cert(require(path.resolve(__dirname, 'firebase-key.json')))
-});
-const db = admin.firestore();
-
-// 🚀 Express
 const app = express();
 const port = 3000;
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 
-// 🔗 WhatsApp Client
+
+mongoose.connect(
+  'mongodb+srv://filhodarlan909:<dd6dulg7>@whatsapp.1gyoobj.mongodb.net/whatsapp?retryWrites=true&w=majority&appName=whatsapp',
+  { useNewUrlParser: true, useUnifiedTopology: true }
+);
+
+const Message = mongoose.model('Message', new mongoose.Schema({
+  nome: String,
+  telefone: String,
+  destinatario: String,
+  mensagem: String,
+  isGroup: Boolean,
+  data: { type: Date, default: Date.now },
+  arquivo: {
+    mimetype: String,
+    filename: String,
+    data: String,
+  }
+}));
+
+
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: { headless: true, args: ['--no-sandbox'] }
 });
 
-// 🔥 Evento QR Code
-client.on('qr', (qr) => {
-  console.log('📲 Escaneie o QR Code:');
-  qrcode.generate(qr, { small: true });
-});
+let qrCodeBase64 = null;
+let isReady = false;
 
-// 🔥 Evento pronto
-client.on('ready', () => {
-  console.log('✅ WhatsApp conectado!');
-});
-
-// 🔥 Evento desconectado
-client.on('disconnected', (reason) => {
-  console.log('❌ WhatsApp desconectado:', reason);
-});
-
-// 📞 Função para padronizar telefone
 function padronizarTelefone(numero) {
   let apenasDigitos = numero.replace(/\D/g, '');
   if (!apenasDigitos.startsWith('55')) {
@@ -48,28 +46,40 @@ function padronizarTelefone(numero) {
   return apenasDigitos;
 }
 
-// ⚙️ Seu número pessoal (ajuste para seu número)
-const meuTelefone = '5588997245006';
+client.on('qr', async (qr) => {
+  qrCodeBase64 = await qrcode.toDataURL(qr);
+  isReady = false;
+  console.log('📲 Escaneie o QR Code com seu WhatsApp');
+});
 
-// 🔥 Escutar mensagens recebidas
+client.on('ready', () => {
+  isReady = true;
+  console.log('✅ WhatsApp conectado!');
+});
+
+
+client.on('disconnected', (reason) => {
+  console.log('❌ WhatsApp desconectado:', reason);
+});
+
+
 client.on('message', async (msg) => {
   try {
     const contato = await msg.getContact();
     const nome = contato.pushname || contato.name || 'Sem nome';
     const isGroup = msg.from.endsWith('@g.us');
 
-    let telefone = isGroup ? msg.from : padronizarTelefone(contato.number);
+    const telefone = isGroup ? msg.from : padronizarTelefone(contato.number);
 
     const data = {
       nome,
       telefone,
-      destinatario: isGroup ? null : meuTelefone,
+      destinatario: isGroup ? null : telefone,
       mensagem: msg.body,
       isGroup,
-      data: admin.firestore.FieldValue.serverTimestamp(),
+      data: new Date(),
     };
 
-    // Se for mídia
     if (msg.hasMedia) {
       const media = await msg.downloadMedia();
       if (media) {
@@ -81,117 +91,93 @@ client.on('message', async (msg) => {
       }
     }
 
-    await db.collection('mensagens').add(data);
-    console.log('💾 Mensagem salva:', data);
-  } catch (error) {
-    console.error('❌ Erro ao salvar mensagem recebida:', error);
+    await Message.create(data);
+    console.log('💾 Mensagem salva no MongoDB');
+  } catch (e) {
+    console.error('❌ Erro ao salvar mensagem:', e);
   }
 });
 
-// 🔗 Listar contatos
+
+app.get('/qrcode', async (req, res) => {
+  if (isReady) return res.json({ status: 'connected' });
+  res.json({ status: 'waiting', qr: qrCodeBase64 });
+});
+
+
+app.get('/status', async (req, res) => {
+  res.json({ status: isReady ? 'connected' : 'disconnected' });
+});
+
+
 app.get('/contacts', async (req, res) => {
-  try {
-    const mensagensSnapshot = await db.collection('mensagens')
-      .orderBy('data', 'desc')
-      .get();
+  const mensagens = await Message.find().sort({ data: -1 });
+  const contatosMap = new Map();
 
-    const contatosMap = new Map();
+  mensagens.forEach(data => {
+    const tel = data.telefone;
+    if (!contatosMap.has(tel)) {
+      contatosMap.set(tel, {
+        telefone: tel,
+        nome: data.nome || 'Sem nome',
+        isGroup: data.isGroup || false,
+      });
+    }
+  });
 
-    mensagensSnapshot.forEach(doc => {
-      const data = doc.data();
-      const tel = data.telefone;
-      if (tel !== meuTelefone) {
-        if (!contatosMap.has(tel)) {
-          contatosMap.set(tel, {
-            telefone: tel,
-            nome: data.nome || 'Sem nome',
-            isGroup: data.isGroup || false,
-          });
-        }
-      }
-    });
-
-    res.json(Array.from(contatosMap.values()));
-  } catch (error) {
-    console.error('❌ Erro ao buscar contatos:', error);
-    res.status(500).json({ error: 'Erro ao buscar contatos' });
-  }
+  res.json(Array.from(contatosMap.values()));
 });
 
-// 🔗 Buscar chat por telefone
+
 app.get('/chat/:telefone', async (req, res) => {
-  try {
-    const contatoTelefone = req.params.telefone;
+  const telefone = req.params.telefone;
+  const mensagens = await Message.find({
+    $or: [
+      { telefone },
+      { destinatario: telefone }
+    ]
+  }).sort({ data: 1 });
 
-    const mensagensSnapshot = await db.collection('mensagens')
-      .orderBy('data', 'asc')
-      .get();
-
-    const mensagens = [];
-
-    mensagensSnapshot.forEach(doc => {
-      const data = doc.data();
-      const telefoneMsg = data.telefone;
-      const destinatarioMsg = data.destinatario || null;
-      if (!data.data) return;
-
-      if (
-        telefoneMsg === contatoTelefone ||
-        (telefoneMsg === meuTelefone && destinatarioMsg === contatoTelefone)
-      ) {
-        mensagens.push({
-          telefone: telefoneMsg,
-          mensagem: data.mensagem,
-          data: data.data.toDate(),
-          nome: data.nome || '',
-          arquivo: data.arquivo || null,
-        });
-      }
-    });
-
-    res.json(mensagens);
-  } catch (error) {
-    console.error('❌ Erro ao buscar mensagens:', error);
-    res.status(500).json({ error: 'Erro ao buscar mensagens' });
-  }
+  res.json(mensagens.map(m => ({
+    telefone: m.telefone,
+    mensagem: m.mensagem,
+    data: m.data,
+    nome: m.nome,
+    arquivo: m.arquivo || null,
+  })));
 });
 
-// 🔗 Enviar mensagem de texto
+
 app.post('/send-message', async (req, res) => {
   try {
     let { telefone, mensagem } = req.body;
-    if (!telefone || !mensagem) {
-      return res.status(400).json({ error: 'Telefone e mensagem são obrigatórios' });
-    }
+    if (!telefone || !mensagem) return res.status(400).json({ error: 'Campos obrigatórios' });
 
     telefone = padronizarTelefone(telefone);
     const chatId = telefone.includes('@') ? telefone : `${telefone}@c.us`;
 
-    const sentMessage = await client.sendMessage(chatId, mensagem);
+    const sent = await client.sendMessage(chatId, mensagem);
 
-    await db.collection('mensagens').add({
+    await Message.create({
       nome: 'Eu',
-      telefone: meuTelefone,
+      telefone: 'meu-numero-aqui',
       destinatario: telefone,
       mensagem,
       isGroup: chatId.endsWith('@g.us'),
-      data: admin.firestore.FieldValue.serverTimestamp(),
+      data: new Date(),
     });
 
-    return res.json({ success: true, messageId: sentMessage.id._serialized });
-  } catch (error) {
-    console.error('❌ Erro ao enviar mensagem:', error);
-    return res.status(500).json({ error: 'Erro ao enviar mensagem' });
+    res.json({ success: true, id: sent.id._serialized });
+  } catch (err) {
+    console.error('❌ Erro ao enviar mensagem:', err);
+    res.status(500).json({ error: 'Erro interno' });
   }
 });
 
-// 🔗 Enviar arquivo (mídia)
 app.post('/send-file', async (req, res) => {
   try {
     const { telefone, base64, filename, mimetype, legenda } = req.body;
-    if (!telefone || !base64 || !filename) {
-      return res.status(400).json({ error: 'Dados incompletos' });
-    }
+    if (!telefone || !base64 || !filename) return res.status(400).json({ error: 'Dados incompletos' });
 
     const tel = padronizarTelefone(telefone);
     const chatId = tel.includes('@') ? tel : `${tel}@c.us`;
@@ -199,13 +185,13 @@ app.post('/send-file', async (req, res) => {
     const media = new MessageMedia(mimetype, base64, filename);
     await client.sendMessage(chatId, media, { caption: legenda });
 
-    await db.collection('mensagens').add({
+    await Message.create({
       nome: 'Eu',
-      telefone: meuTelefone,
+      telefone: 'meu-numero-aqui',
       destinatario: tel,
       mensagem: legenda || '',
       isGroup: chatId.endsWith('@g.us'),
-      data: admin.firestore.FieldValue.serverTimestamp(),
+      data: new Date(),
       arquivo: {
         mimetype,
         filename,
@@ -213,17 +199,12 @@ app.post('/send-file', async (req, res) => {
       },
     });
 
-    return res.json({ success: true });
-  } catch (error) {
-    console.error('❌ Erro ao enviar arquivo:', error);
-    return res.status(500).json({ error: 'Erro ao enviar arquivo' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('❌ Erro ao enviar arquivo:', err);
+    res.status(500).json({ error: 'Erro interno' });
   }
 });
 
-// 🚀 Inicializa o WhatsApp
 client.initialize();
-
-// 🚀 Inicializa o servidor
-app.listen(port, () => {
-  console.log(`🚀 API rodando em http://localhost:${port}`);
-});
+app.listen(port, () => console.log(`🚀 API rodando em http://localhost:${port}`));
